@@ -46,6 +46,7 @@
 #include "heap_tagging.h"
 #include "private/ScopedPthreadMutexLocker.h"
 #include "private/WriteProtected.h"
+#include "private/bionic_arc4random.h"
 #include "private/bionic_defs.h"
 #include "private/bionic_globals.h"
 #include "private/bionic_tls.h"
@@ -89,6 +90,11 @@ void __libc_init_globals() {
   __libc_globals.mutate([](libc_globals* globals) {
     __libc_init_vdso(globals);
     __libc_init_setjmp_cookie(globals);
+    // first_stage_init can run before any entropy is available; a zero cookie
+    // only disables the mangling there.
+    if (__libc_arc4random_ready()) {
+      arc4random_buf(&globals->dtor_cookie, sizeof(globals->dtor_cookie));
+    }
   });
 }
 
