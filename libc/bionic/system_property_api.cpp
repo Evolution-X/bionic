@@ -200,7 +200,27 @@ bool __system_property_wait(const prop_info* pi, uint32_t old_serial, uint32_t* 
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 const prop_info* __system_property_find_nth(unsigned n) {
-  return system_properties.FindNth(n);
+  if (!custom_rom_hide_is_droidguard_process()) {
+    return system_properties.FindNth(n);
+  }
+
+  // Present DroidGuard with a compact list: n counts visible props, not raw area
+  // slots, so keys hidden from find/foreach cannot be recovered by index.
+  struct find_visible_nth {
+    const unsigned sought;
+    unsigned visible;
+    const prop_info* result;
+
+    explicit find_visible_nth(unsigned n) : sought(n), visible(0), result(nullptr) {}
+    static void fn(const prop_info* pi, void* ptr) {
+      auto* self = static_cast<find_visible_nth*>(ptr);
+      if (self->result) return;
+      if (custom_rom_hide_should_hide_prop(pi->name)) return;
+      if (self->visible++ == self->sought) self->result = pi;
+    }
+  } state(n);
+  system_properties.Foreach(find_visible_nth::fn, &state);
+  return state.result;
 }
 
 struct ForeachOverrideCtx {

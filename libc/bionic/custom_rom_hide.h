@@ -28,6 +28,7 @@ struct statx;
 __BEGIN_DECLS
 
 bool custom_rom_hide_is_app_process();
+bool custom_rom_hide_is_droidguard_process();
 
 bool custom_rom_hide_should_block(const char* path);
 bool custom_rom_hide_should_block_at(int dirfd, const char* path);
@@ -37,6 +38,8 @@ bool custom_rom_hide_is_empty_path(const char* path);
 
 void custom_rom_hide_spoof_stat(const char* path, struct stat* sb);
 void custom_rom_hide_spoof_statx(const char* path, struct statx* sx);
+void custom_rom_hide_spoof_stat_at(int dirfd, const char* path, struct stat* sb);
+void custom_rom_hide_spoof_statx_at(int dirfd, const char* path, struct statx* sx);
 void custom_rom_hide_spoof_statfs(const char* path, struct statfs* sf);
 void custom_rom_hide_spoof_fd_stat(int fd, struct stat* sb);
 void custom_rom_hide_spoof_fd_statx(int fd, unsigned mask, struct statx* sx);
@@ -47,6 +50,9 @@ void custom_rom_hide_transfer_fd(int old_fd, int new_fd);
 int custom_rom_hide_filter_vintf(const char* path);
 int custom_rom_hide_filter_proc(const char* path);
 int custom_rom_hide_filter_sepolicy(const char* path);
+int custom_rom_hide_filter_build_prop(int dirfd, const char* path);
+bool custom_rom_hide_resolve_path(int dirfd, const char* path, char* out, size_t out_size);
+bool custom_rom_hide_resolve_proc_fd_path(const char* path, char* out, size_t out_size);
 
 bool custom_rom_hide_should_spoof_prop(const char* name, char* value);
 bool custom_rom_hide_should_hide_prop(const char* name);

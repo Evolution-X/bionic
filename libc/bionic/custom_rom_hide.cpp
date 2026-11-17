@@ -123,10 +123,13 @@ static const PrefixEntry kConfigDirs[] = {
     PE("/odm/etc/init"),
     PE("/system/etc/permissions"),  PE("/system_ext/etc/permissions"),
     PE("/product/etc/permissions"), PE("/vendor/etc/permissions"),
+    PE("/odm/etc/permissions"),
     PE("/system/etc/sysconfig"),    PE("/system_ext/etc/sysconfig"),
-    PE("/product/etc/sysconfig"),
+    PE("/product/etc/sysconfig"),   PE("/vendor/etc/sysconfig"),
+    PE("/odm/etc/sysconfig"),
     PE("/system/etc/vintf"),        PE("/system_ext/etc/vintf"),
     PE("/product/etc/vintf"),       PE("/vendor/etc/vintf"),
+    PE("/odm/etc/vintf"),
     { nullptr, 0 }
 };
 
@@ -147,12 +150,16 @@ struct PartitionDevEntry {
 };
 
 static const PartitionDevEntry kPartitionDmMap[] = {
-    { "/system",     0 },
-    { "/vendor",     1 },
-    { "/product",    2 },
-    { "/system_ext", 3 },
-    { "/odm",        4 },
-    { nullptr,       0 },
+    { "/system",            0 },
+    { "/vendor",            1 },
+    { "/product",           2 },
+    { "/system_ext",        3 },
+    { "/odm",               4 },
+    { "/system/vendor",     1 },
+    { "/system/product",    2 },
+    { "/system/system_ext", 3 },
+    { "/system/odm",        4 },
+    { nullptr,              0 },
 };
 
 static _Atomic(uint64_t) g_substituted_fd_bits[HIDE_TRACKED_FD_WORD_COUNT];
@@ -289,6 +296,19 @@ static inline int raw_memfd_create(const char* name, unsigned int flags) {
 
 static inline ssize_t raw_readlinkat(const char* path, char* buf, size_t size) {
     return syscall(__NR_readlinkat, AT_FDCWD, path, buf, size);
+}
+
+static bool read_cwd_path(char* buf, size_t size) {
+    if (!buf || size < 2) return false;
+    int saved_errno = errno;
+    ssize_t n = raw_readlinkat("/proc/self/cwd", buf, size - 1);
+    if (n > 0 && static_cast<size_t>(n) < size) {
+        buf[n] = '\0';
+        errno = saved_errno;
+        return true;
+    }
+    errno = saved_errno;
+    return false;
 }
 
 static inline int raw_fstatat(int dirfd, const char* path, struct stat* sb, int flags) {
@@ -494,23 +514,115 @@ static bool is_blocked_dir(const char* path) {
     return false;
 }
 
+static bool normalize_absolute_path(const char* path, char* out, size_t out_size) {
+    if (!path || path[0] != '/' || !out || out_size < 2) return false;
+
+    size_t out_len = 0;
+    out[out_len++] = '/';
+    const char* p = path;
+    while (*p) {
+        while (*p == '/') ++p;
+        if (!*p) break;
+
+        const char* segment = p;
+        while (*p && *p != '/') ++p;
+        size_t segment_len = static_cast<size_t>(p - segment);
+
+        if (segment_len == 1 && segment[0] == '.') continue;
+        if (segment_len == 2 && segment[0] == '.' && segment[1] == '.') {
+            while (out_len > 1 && out[out_len - 1] != '/') --out_len;
+            if (out_len > 1) --out_len;
+            continue;
+        }
+
+        if (out_len > 1) {
+            if (out_len + 1 >= out_size) return false;
+            out[out_len++] = '/';
+        }
+        if (out_len + segment_len >= out_size) return false;
+        memcpy(out + out_len, segment, segment_len);
+        out_len += segment_len;
+    }
+
+    out[out_len] = '\0';
+    return true;
+}
+
+static bool path_is_config_artifact(const char* path) {
+    if (!path) return false;
+
+    for (const PrefixEntry* d = kConfigDirs; d->str; ++d) {
+        if (strncmp(path, d->str, d->len) != 0 || path[d->len] != '/') continue;
+
+        const char* rest = path + d->len + 1;
+        while (*rest) {
+            const char* slash = strchr(rest, '/');
+            size_t component_len = slash ? static_cast<size_t>(slash - rest) : strlen(rest);
+            if (component_len >= 512) return false;
+
+            char component[512];
+            memcpy(component, rest, component_len);
+            component[component_len] = '\0';
+            if (name_has_rom_keyword(component) || basename_is_rom_artifact(component)) {
+                return true;
+            }
+            if (!slash) break;
+            rest = slash + 1;
+        }
+    }
+    return false;
+}
+
+static bool path_may_be_config_path(const char* path) {
+    if (!path) return false;
+    if (strstr(path, "etc/") != nullptr) return true;
+    for (const PrefixEntry* kw = kProcFilterKeywords; kw->str; ++kw) {
+        if (strstr(path, kw->str) != nullptr) return true;
+    }
+    for (const char* const* dn = kBlockedDirnames; *dn; ++dn) {
+        if (strstr(path, *dn) != nullptr) return true;
+    }
+    return false;
+}
+
+static bool path_is_in_blocked_dir(const char* path) {
+    bool candidate = false;
+    for (const char* const* dn = kBlockedDirnames; *dn; ++dn) {
+        if (strstr(path, *dn) != nullptr) { candidate = true; break; }
+    }
+    if (!candidate) return false;
+
+    char prefix[512];
+    size_t len = 0;
+    const char* p = path;
+    while (*p) {
+        while (*p == '/') ++p;
+        if (!*p) break;
+
+        const char* segment = p;
+        while (*p && *p != '/') ++p;
+        size_t segment_len = static_cast<size_t>(p - segment);
+        if (len + 1 + segment_len >= sizeof(prefix)) return false;
+
+        prefix[len++] = '/';
+        memcpy(prefix + len, segment, segment_len);
+        len += segment_len;
+        prefix[len] = '\0';
+        if (is_blocked_dir(prefix)) return true;
+    }
+    return false;
+}
+
 static bool is_rom_path(const char* path) {
     if (!path || path[0] != '/') return false;
 
-    size_t len = strlen(path);
-    bool has_trailing = len > 1 && path[len - 1] == '/';
-    char stack_buf[512];
-    const char* clean = path;
-    if (has_trailing) {
-        if (len >= sizeof(stack_buf)) len = sizeof(stack_buf) - 1;
-        memcpy(stack_buf, path, len);
-        while (len > 1 && stack_buf[len - 1] == '/') len--;
-        stack_buf[len] = '\0';
-        clean = stack_buf;
-    }
+    char normalized[512];
+    if (!normalize_absolute_path(path, normalized, sizeof(normalized))) return false;
 
-    if (is_blocked_dir(clean)) return true;
-    if (is_rom_framework_artifact(clean)) return true;
+    if (is_blocked_dir(normalized)) return true;
+    if (path_is_in_blocked_dir(normalized)) return true;
+    if (is_rom_framework_artifact(normalized)) return true;
+    if (path_is_config_artifact(normalized)) return true;
     return false;
 }
 
@@ -565,14 +677,64 @@ out:
     return result;
 }
 
+static bool resolve_path_at(int dirfd, const char* path, char* out, size_t out_size) {
+    char local[512];
+    if (safe_copy_string(path, local, sizeof(local)) < 0) return false;
+    if (local[0] == '/') return normalize_absolute_path(local, out, out_size);
+
+    char dir_path[512];
+    bool have_dir = dirfd == AT_FDCWD
+            ? read_cwd_path(dir_path, sizeof(dir_path))
+            : resolve_fd_path(dirfd, dir_path, sizeof(dir_path));
+    if (!have_dir) return false;
+
+    char full_path[1024];
+    int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, local);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(full_path)) return false;
+    return normalize_absolute_path(full_path, out, out_size);
+}
+
+bool custom_rom_hide_resolve_path(int dirfd, const char* path, char* out, size_t out_size) {
+    return resolve_path_at(dirfd, path, out, out_size);
+}
+
+static bool proc_fd_alias_is_hidden(const char* path) {
+    if (!path) return false;
+    int saved_errno = errno;
+    char target[512];
+    bool hidden = custom_rom_hide_resolve_proc_fd_path(path, target, sizeof(target)) &&
+                  is_rom_path(target);
+    errno = saved_errno;
+    return hidden;
+}
+
 bool custom_rom_hide_should_block(const char* path) {
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return false;
     if (!is_app_process()) return false;
 
     char local[512];
     if (safe_copy_string(path, local, sizeof(local)) < 0) return false;
-    if (local[0] != '/') return false;
-    return is_rom_path(local);
+    if (proc_fd_alias_is_hidden(local)) return true;
+    if (local[0] == '/') return is_rom_path(local);
+
+    const char* base = path_basename(local);
+    size_t local_len = strlen(local);
+    bool candidate = local_len > 0 && local[local_len - 1] == '/';
+    for (const char* const* dn = kBlockedDirnames; !candidate && *dn; ++dn) {
+        if (strcmp(base, *dn) == 0) { candidate = true; break; }
+    }
+    if (!candidate && basename_is_rom_artifact(base)) candidate = true;
+    if (!candidate && name_has_rom_keyword(base)) candidate = true;
+    if (!candidate && path_may_be_config_path(local)) candidate = true;
+    if (!candidate && (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)) candidate = true;
+    if (!candidate) return false;
+
+    char cwd[512];
+    if (!read_cwd_path(cwd, sizeof(cwd))) return false;
+    char full_path[1024];
+    int n = snprintf(full_path, sizeof(full_path), "%s/%s", cwd, local);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(full_path)) return false;
+    return is_rom_path(full_path);
 }
 
 bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
@@ -588,9 +750,11 @@ bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
         return false;
     }
 
-    if (local[0] == '/') {
+    if (proc_fd_alias_is_hidden(local)) {
+        result = true;
+    } else if (local[0] == '/') {
         result = is_rom_path(local);
-    } else if (dirfd != AT_FDCWD) {
+    } else {
         size_t plen = strlen(local);
         bool candidate = plen > 0 && local[plen - 1] == '/';
         if (!candidate) {
@@ -599,14 +763,20 @@ bool custom_rom_hide_should_block_at(int dirfd, const char* path) {
                 if (strcmp(base, *dn) == 0) { candidate = true; break; }
             }
             if (!candidate && basename_is_rom_artifact(base)) candidate = true;
+            if (!candidate && name_has_rom_keyword(base)) candidate = true;
+            if (!candidate && path_may_be_config_path(local)) candidate = true;
+            if (!candidate && (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)) candidate = true;
         }
         if (candidate) {
-            char dir_path[256];
-            if (resolve_fd_path(dirfd, dir_path, sizeof(dir_path))) {
-                char full_path[512 + 256 + 1];
+            char dir_path[512];
+            bool have_dir = dirfd == AT_FDCWD
+                    ? read_cwd_path(dir_path, sizeof(dir_path))
+                    : resolve_fd_path(dirfd, dir_path, sizeof(dir_path));
+            if (have_dir) {
+                char full_path[1024];
                 int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, local);
                 if (n > 0 && static_cast<size_t>(n) < sizeof(full_path)) {
-                    result = is_rom_path(full_path);
+                    result = proc_fd_alias_is_hidden(full_path) || is_rom_path(full_path);
                 }
             }
         }
@@ -984,6 +1154,225 @@ static bool filter_cmdline(int mem_fd, char* content, size_t len) {
     return raw_write_all(mem_fd, content, strnlen(content, len));
 }
 
+struct BuildPropLine {
+    const char* start;
+    const char* key;
+    size_t key_len;
+    const char* eq;
+    const char* value;
+    size_t value_len;
+    bool has_cr;
+    bool has_nl;
+    bool valid;
+};
+
+static BuildPropLine parse_build_prop_line(const char* line) {
+    BuildPropLine p = {};
+    if (!line) return p;
+
+    p.start = line;
+    while (*line == ' ' || *line == '\t') ++line;
+    if (*line == '\0' || *line == '\n' || *line == '\r' || *line == '#') return p;
+
+    const char* eq = line;
+    while (*eq && *eq != '=' && *eq != '\n' && *eq != '\r') ++eq;
+    if (*eq != '=') return p;
+
+    p.key = line;
+    p.eq = eq;
+    p.key_len = static_cast<size_t>(eq - line);
+    while (p.key_len > 0 &&
+           (line[p.key_len - 1] == ' ' || line[p.key_len - 1] == '\t')) {
+        --p.key_len;
+    }
+    if (p.key_len == 0) return p;
+
+    const char* value = eq + 1;
+    const char* end = value;
+    while (*end && *end != '\n' && *end != '\r') ++end;
+    p.value = value;
+    p.value_len = static_cast<size_t>(end - value);
+    p.has_cr = (*end == '\r');
+    p.has_nl = (*end == '\n') || (p.has_cr && end[1] == '\n');
+    p.valid = true;
+    return p;
+}
+
+static bool copy_build_prop_key(const BuildPropLine& p, char* key, size_t key_size) {
+    if (!p.valid || !key || p.key_len >= key_size) return false;
+    memcpy(key, p.key, p.key_len);
+    key[p.key_len] = '\0';
+    return true;
+}
+
+static bool is_rom_identity_prop_name(const char* key) {
+    static const char kEvolution[] = "ro.evolution.";
+    static const char kLineage[] = "ro.lineage.";
+    static const char kCm[] = "ro.cm.";
+    static const char kModversion[] = "ro.modversion";
+    return strncmp(key, kEvolution, sizeof(kEvolution) - 1) == 0 ||
+           strncmp(key, kLineage, sizeof(kLineage) - 1) == 0 ||
+           strncmp(key, kCm, sizeof(kCm) - 1) == 0 ||
+           strcmp(key, kModversion) == 0;
+}
+
+static bool value_has_rom_keyword(const BuildPropLine& p) {
+    if (!p.valid || p.value_len == 0) return false;
+    for (const PrefixEntry* kw = kProcFilterKeywords; kw->str; ++kw) {
+        if (kw->len <= p.value_len) {
+            for (size_t i = 0; i + kw->len <= p.value_len; ++i) {
+                if (memcmp(p.value + i, kw->str, kw->len) == 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// DroidGuard reads build.prop directly as well as through the property service.
+// Drop hidden/ROM-specific keys, and let the writer below substitute every key
+// that has a PIF or fixed override, so the file agrees with the property API.
+static bool drop_build_prop_line(const char* line, void*) {
+    BuildPropLine p = parse_build_prop_line(line);
+    if (!p.valid) return false;
+
+    char key[128];
+    if (!copy_build_prop_key(p, key, sizeof(key))) return false;
+
+    if (custom_rom_hide_should_hide_prop(key)) return true;
+
+    char override_buffer[PROP_VALUE_MAX];
+    if (custom_rom_hide_get_prop_override(key, override_buffer)) return false;
+
+    if (is_rom_identity_prop_name(key)) return true;
+    return value_has_rom_keyword(p);
+}
+
+static bool write_build_prop_override(int mem_fd, char* line, size_t line_len, void*) {
+    BuildPropLine p = parse_build_prop_line(line);
+    char key[128];
+    if (!p.valid || !copy_build_prop_key(p, key, sizeof(key))) {
+        return raw_write_all(mem_fd, line, line_len);
+    }
+
+    char override_buffer[PROP_VALUE_MAX];
+    const char* override_value = custom_rom_hide_get_prop_override(key, override_buffer);
+    if (!override_value) return raw_write_all(mem_fd, line, line_len);
+
+    if (!raw_write_all(mem_fd, p.start, static_cast<size_t>(p.eq - p.start + 1)) ||
+        !raw_write_all(mem_fd, override_value, strlen(override_value))) {
+        return false;
+    }
+    if (p.has_cr && !raw_write_all(mem_fd, "\r", 1)) return false;
+    if (p.has_nl && !raw_write_all(mem_fd, "\n", 1)) return false;
+    return true;
+}
+
+static const char* const kBuildPropPaths[] = {
+    "/system/build.prop",
+    "/vendor/build.prop",
+    "/product/build.prop",
+    "/system_ext/build.prop",
+    "/odm/build.prop",
+    "/system/etc/prop.default",
+    "/vendor/default.prop",
+    "/system_root/build.prop",
+    "/root/build.prop",
+    "/system/system/build.prop",
+    nullptr
+};
+
+static bool is_build_prop_path(const char* path) {
+    if (!path) return false;
+    for (const char* const* p = kBuildPropPaths; *p; ++p) {
+        if (strcmp(path, *p) == 0) return true;
+    }
+    const char* base = path_basename(path);
+    return strcmp(base, "build.prop") == 0 ||
+           strcmp(base, "prop.default") == 0 ||
+           strcmp(base, "default.prop") == 0;
+}
+
+static bool path_may_be_build_prop(const char* path) {
+    if (!path) return false;
+    const char* base = path_basename(path);
+    return strcmp(base, "build.prop") == 0 ||
+           strcmp(base, "prop.default") == 0 ||
+           strcmp(base, "default.prop") == 0;
+}
+
+static bool resolve_proc_path_via_open(const char* path, char* out, size_t out_size) {
+    int saved_errno = errno;
+    int fd = raw_openat(path, O_PATH | O_CLOEXEC);
+    if (fd < 0) {
+        errno = saved_errno;
+        return false;
+    }
+
+    bool resolved = resolve_fd_path(fd, out, out_size);
+    raw_close(fd);
+    errno = saved_errno;
+    return resolved;
+}
+
+static bool resolve_proc_fd_path(const char* path, char* out, size_t out_size) {
+    static const char kSelf[] = "/proc/self/fd/";
+    static const char kThread[] = "/proc/thread-self/fd/";
+    static const char kDev[] = "/dev/fd/";
+
+    const char* p = nullptr;
+    if (strncmp(path, kSelf, sizeof(kSelf) - 1) == 0) {
+        p = path + sizeof(kSelf) - 1;
+    } else if (strncmp(path, kThread, sizeof(kThread) - 1) == 0) {
+        p = path + sizeof(kThread) - 1;
+    } else if (strncmp(path, kDev, sizeof(kDev) - 1) == 0) {
+        p = path + sizeof(kDev) - 1;
+    }
+    if (!p) {
+        if (strncmp(path, "/proc/", 6) != 0) return false;
+        if (strstr(path, "/root") == nullptr && strstr(path, "/cwd") == nullptr &&
+            strstr(path, "/fd/") == nullptr) {
+            return false;
+        }
+        return resolve_proc_path_via_open(path, out, out_size);
+    }
+    if (*p == '\0') return false;
+
+    int fd = 0;
+    for (; *p >= '0' && *p <= '9'; ++p) {
+        if (fd > 1000000) return false;
+        fd = fd * 10 + (*p - '0');
+    }
+    if (*p != '\0') {
+        return strstr(path, "/fd/") != nullptr &&
+               resolve_proc_path_via_open(path, out, out_size);
+    }
+    return resolve_fd_path(fd, out, out_size);
+}
+
+bool custom_rom_hide_resolve_proc_fd_path(const char* path, char* out, size_t out_size) {
+    if (!path) return false;
+    return resolve_proc_fd_path(path, out, out_size);
+}
+
+int custom_rom_hide_filter_build_prop(int dirfd, const char* path) {
+    if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return -1;
+
+    char resolved[512];
+    if (resolve_proc_fd_path(path, resolved, sizeof(resolved))) {
+        if (!is_build_prop_path(resolved)) return -1;
+    } else {
+        if (!path_may_be_build_prop(path)) return -1;
+        if (!resolve_path_at(dirfd, path, resolved, sizeof(resolved))) return -1;
+        if (!is_build_prop_path(resolved)) return -1;
+    }
+    if (!is_app_process() || !is_droidguard_process()) return -1;
+
+    int saved_errno = errno;
+    int mem_fd = filter_file_with(resolved, drop_build_prop_line, write_build_prop_override, nullptr);
+    errno = saved_errno;
+    return mem_fd;
+}
+
 struct MountDm { const char* mnt; const char* dev; };
 static const MountDm kMountDm[] = {
     { " /system ",     "/dev/block/dm-0" },
@@ -1208,6 +1597,20 @@ static const char* const kSpoofedEmptyProps[] = {
     "init.svc.adb_root", "service.adb.root", nullptr
 };
 
+// DroidGuard also enumerates the property area, so an empty value is not enough:
+// remove the key itself from find/foreach in that process. Normal apps keep seeing
+// these props; direct value reads still honor an exact configured PIF override.
+static const char* const kDroidGuardHiddenProps[] = {
+    "ro.evolution.device", "ro.lineage.device", "ro.cm.device", nullptr
+};
+
+static bool is_hidden_droidguard_prop(const char* name) {
+    for (const char* const* p = kDroidGuardHiddenProps; *p; ++p) {
+        if (strcmp(name, *p) == 0) return is_droidguard_process();
+    }
+    return false;
+}
+
 struct PropOverride { const char* name; const char* value; };
 static const PropOverride kSpoofedValueProps[] = {
     {"ro.debuggable", "0"},
@@ -1251,6 +1654,7 @@ static const DynamicPropOverride kDynamicProductProps[] = {
     {"ro.product.vendor.brand",        "persist.sys.pif.product.brand"},
     {"ro.product.vendor.model",        "persist.sys.pif.product.model"},
     {"ro.build.product",               "persist.sys.pif.product.device"},
+    {"ro.build.display.id",             "persist.sys.pif.build.id"},
     {"ro.build.description",           "persist.sys.pif.build.description"},
     {"ro.build.flavor",                "persist.sys.pif.build.flavor"},
     {nullptr, nullptr}
@@ -1289,26 +1693,62 @@ struct DynamicSuffixOverride { const char* suffix; size_t suffix_len; const char
 #define DYNAMIC_SUFFIX(suffix, staging) { suffix, sizeof(suffix) - 1, staging }
 static const DynamicSuffixOverride kDynamicSuffixProps[] = {
     DYNAMIC_SUFFIX(".build.id",        "persist.sys.pif.build.id"),
+    DYNAMIC_SUFFIX(".build.display.id", "persist.sys.pif.build.id"),
+    DYNAMIC_SUFFIX(".build.description", "persist.sys.pif.build.description"),
+    DYNAMIC_SUFFIX(".build.flavor",    "persist.sys.pif.build.flavor"),
+    DYNAMIC_SUFFIX(".build.product",   "persist.sys.pif.product.device"),
     DYNAMIC_SUFFIX(".security_patch",  "persist.sys.pif.security_patch"),
     DYNAMIC_SUFFIX("api_level",        "persist.sys.pif.api_level"),
     // ro.build.version.real_security_patch, which ".security_patch" does not reach.
     DYNAMIC_SUFFIX(".real_security_patch", "persist.sys.pif.security_patch"),
-    // The build type and tags of the partitions kSpoofedValueProps doesn't pin (odm, product,
-    // system_ext, bootimage, ...), taken from the fingerprint instead of a fixed value.
+    // Build description/flavor/product/display and type/tags for the partitions
+    // kSpoofedValueProps does not pin (odm, product, system_ext, bootimage, ...),
+    // all taken from the same staged PIF identity as the fingerprint.
     DYNAMIC_SUFFIX(".build.type",      "persist.sys.pif.build.type"),
     DYNAMIC_SUFFIX(".build.tags",      "persist.sys.pif.build.tags"),
     {nullptr, 0, nullptr}
 };
 
+static bool has_prop_suffix(const char* name, const char* suffix) {
+    size_t name_len = strlen(name);
+    size_t suffix_len = strlen(suffix);
+    return name_len > suffix_len && strcmp(name + name_len - suffix_len, suffix) == 0;
+}
+
 // Fixed values served to DroidGuard only, as PIFork's property hook does. adbd
-// and USB state are read by init, system_server and Settings, none of which are
-// app processes, so they keep the real values. Only the property callback path
-// applies these, like the dynamic tables above.
+// and USB state are read by init, system_server and Settings; none of them is
+// DroidGuard, so they keep the real values. Applied on both the direct
+// __system_property_get/__system_property_read paths and the property
+// callback/serial path; the dynamic tables above stay callback-only.
+//
+// The ROM identity props are written by the build itself (soong's
+// gen_build_prop.py) and would let a DroidGuard prop probe name the ROM.
+// Device keys are served empty, build user/host are normalized, and every
+// other process keeps the real values - including the ROM's own apps that
+// match device on them (the PIF device matcher, the Updater and model page).
 static const PropOverride kDroidGuardValueProps[] = {
     {"init.svc.adbd", "stopped"},
     {"sys.usb.state", "mtp"},
+    {"ro.build.user", "android-build"},
+    {"ro.build.host", "android-build"},
+    {"ro.evolution.device", ""},
+    {"ro.lineage.device", ""},
     {nullptr, nullptr}
 };
+
+// Shared by the direct read paths and the callback/serial path.
+static const char* find_droidguard_value_override(const char* name) {
+    for (const PropOverride* o = kDroidGuardValueProps; o->name; ++o) {
+        if (strcmp(name, o->name) == 0) return o->value;
+    }
+    // Partition build.prop files carry the same build user/host as ro.build.
+    // Keep those fields consistent without blanking hardware identity.
+    if (strncmp(name, "ro.", 3) == 0 &&
+        (has_prop_suffix(name, ".build.user") || has_prop_suffix(name, ".build.host"))) {
+        return "android-build";
+    }
+    return nullptr;
+}
 
 static const DynamicSuffixOverride* find_dynamic_suffix_override(const char* name) {
     if (strncmp(name, "ro.", 3) != 0) return nullptr;
@@ -1390,17 +1830,185 @@ static const char* find_custom_prop_override(const char* name, char* buffer, boo
     return nullptr;
 }
 
+static bool is_pif_fingerprint_name(const char* name) {
+    return strcmp(name, "ro.build.fingerprint") == 0 ||
+           (strncmp(name, "ro.", 3) == 0 && has_prop_suffix(name, ".build.fingerprint"));
+}
+
+static bool is_pif_build_version_name(const char* name, bool* is_release) {
+    if (strncmp(name, "ro.", 3) != 0) return false;
+    if (has_prop_suffix(name, ".version.release") ||
+        has_prop_suffix(name, ".version.release_or_codename")) {
+        *is_release = true;
+        return true;
+    }
+    if (has_prop_suffix(name, ".version.incremental")) {
+        *is_release = false;
+        return true;
+    }
+    return false;
+}
+
+static bool is_pif_derived_name(const char* name) {
+    bool is_release = false;
+    return is_pif_fingerprint_name(name) || is_pif_build_version_name(name, &is_release);
+}
+
+struct PifDescription {
+    char product[PROP_VALUE_MAX];
+    char release[PROP_VALUE_MAX];
+    char id[PROP_VALUE_MAX];
+    char incremental[PROP_VALUE_MAX];
+    char type[PROP_VALUE_MAX];
+    char tags[PROP_VALUE_MAX];
+    bool valid;
+};
+
+static bool copy_pif_field(char* dst, const char* src) {
+    size_t len = strlen(src);
+    if (len >= PROP_VALUE_MAX) return false;
+    memcpy(dst, src, len + 1);
+    return true;
+}
+
+// AxSpoofManager stages the stock build description as
+// "product-type release id incremental tags". The fingerprint adds the brand,
+// product and device from the staged product identity to the same fields.
+static PifDescription read_pif_description() {
+    PifDescription d = {};
+    char description[PROP_VALUE_MAX];
+    if (__system_property_get("persist.sys.pif.build.description", description) <= 0) return d;
+
+    char* tokens[5] = {};
+    int count = 0;
+    char* p = description;
+    while (*p && count < 5) {
+        while (*p == ' ') ++p;
+        if (*p == '\0') break;
+        tokens[count++] = p;
+        while (*p && *p != ' ') ++p;
+        if (*p) *p++ = '\0';
+    }
+    if (count < 5) return d;
+
+    char* dash = strrchr(tokens[0], '-');
+    if (!dash || dash == tokens[0] || dash[1] == '\0') return d;
+    *dash = '\0';
+
+    if (!copy_pif_field(d.product, tokens[0]) ||
+        !copy_pif_field(d.release, tokens[1]) ||
+        !copy_pif_field(d.id, tokens[2]) ||
+        !copy_pif_field(d.incremental, tokens[3]) ||
+        !copy_pif_field(d.type, dash + 1) ||
+        !copy_pif_field(d.tags, tokens[4])) {
+        return d;
+    }
+    d.valid = true;
+    return d;
+}
+
+static const char* pif_derived_override(const char* name, char* buffer) {
+    bool is_release = false;
+    const bool version = is_pif_build_version_name(name, &is_release);
+    const bool fingerprint = is_pif_fingerprint_name(name);
+    if (!version && !fingerprint) return nullptr;
+
+    PifDescription d = read_pif_description();
+    if (!d.valid) return nullptr;
+
+    if (version) {
+        const char* value = is_release ? d.release : d.incremental;
+        if (*value == '\0' || strlen(value) >= PROP_VALUE_MAX) return nullptr;
+        strcpy(buffer, value);
+        return buffer;
+    }
+
+    char brand[PROP_VALUE_MAX];
+    char product[PROP_VALUE_MAX];
+    char device[PROP_VALUE_MAX];
+    char id[PROP_VALUE_MAX];
+    char type[PROP_VALUE_MAX];
+    char tags[PROP_VALUE_MAX];
+    if (__system_property_get("persist.sys.pif.product.brand", brand) <= 0 ||
+        __system_property_get("persist.sys.pif.product.device", device) <= 0 ||
+        *brand == '\0' || *device == '\0') {
+        return nullptr;
+    }
+    if (__system_property_get("persist.sys.pif.product.name", product) <= 0 || *product == '\0') {
+        if (!copy_pif_field(product, d.product)) return nullptr;
+    }
+
+    if (__system_property_get("persist.sys.pif.build.id", id) <= 0 || *id == '\0') {
+        if (!copy_pif_field(id, d.id)) return nullptr;
+    }
+    if (__system_property_get("persist.sys.pif.build.type", type) <= 0 || *type == '\0') {
+        if (!copy_pif_field(type, d.type)) return nullptr;
+    }
+    if (__system_property_get("persist.sys.pif.build.tags", tags) <= 0 || *tags == '\0') {
+        if (!copy_pif_field(tags, d.tags)) return nullptr;
+    }
+    if (*d.release == '\0' || *d.incremental == '\0' || *id == '\0' ||
+        *type == '\0' || *tags == '\0') {
+        return nullptr;
+    }
+
+    int n = snprintf(buffer, PROP_VALUE_MAX, "%s/%s/%s:%s/%s/%s:%s/%s",
+                     brand, product, device, d.release, id, d.incremental, type, tags);
+    if (n <= 0 || n >= PROP_VALUE_MAX) return nullptr;
+    return buffer;
+}
+
+static bool is_dynamic_or_derived_prop(const char* name) {
+    if (is_pif_derived_name(name)) return true;
+    for (const DynamicPropOverride* o = kDynamicProductProps; o->name; ++o) {
+        if (strcmp(name, o->name) == 0) return true;
+    }
+    if (find_product_partition_staging(name)) return true;
+    return find_dynamic_suffix_override(name) != nullptr;
+}
+
 bool custom_rom_hide_should_spoof_prop(const char* name, char* value) {
     if (!name || !value) return false;
     if (reinterpret_cast<uintptr_t>(name) < 0x1000000) return false;
     if (reinterpret_cast<uintptr_t>(value) < 0x1000000) return false;
     if (!is_app_process()) return false;
     if (is_hidden_staging_prop(name)) { value[0] = '\0'; return true; }
+    if (is_hidden_droidguard_prop(name)) {
+        // A configured PIF entry still wins over the fallback empty value.
+        if (const char* v = find_custom_prop_override(name, value, false)) return true;
+        if (const char* v = find_custom_prop_override(name, value, true)) return true;
+        value[0] = '\0';
+        return true;
+    }
+    // These keys are hidden from find/foreach; keep the direct read path in
+    // sync by serving an empty value instead of a configured PIF entry.
     for (const char* const* p = kSpoofedEmptyProps; *p; ++p) {
         if (strcmp(name, *p) == 0) { value[0] = '\0'; return true; }
     }
+    // Apply arbitrary PIF jsonProps to the direct get/read path too. The
+    // callback and serial paths already do this through get_prop_override().
+    if (is_droidguard_process()) {
+        if (const char* v = find_custom_prop_override(name, value, false)) return true;
+        if (const char* v = find_custom_prop_override(name, value, true)) return true;
+        if (is_rom_identity_prop_name(name)) { value[0] = '\0'; return true; }
+    }
+    // The fixed DroidGuard table also applies to the direct get path.
+    if (const char* override_value = find_droidguard_value_override(name)) {
+        if (is_droidguard_process()) {
+            strcpy(value, override_value);
+            return true;
+        }
+    }
     for (const PropOverride* o = kSpoofedValueProps; o->name; ++o) {
         if (strcmp(name, o->name) == 0) { strcpy(value, o->value); return true; }
+    }
+    // PIF build fields are also read through __system_property_get/read, not
+    // only through callbacks. Keep those direct paths consistent with the
+    // callback and build.prop paths without scanning every property name.
+    if (is_droidguard_process() && is_dynamic_or_derived_prop(name)) {
+        if (const char* override_value = custom_rom_hide_get_prop_override(name, value)) {
+            return true;
+        }
     }
     return false;
 }
@@ -1409,8 +2017,20 @@ bool custom_rom_hide_should_hide_prop(const char* name) {
     if (!name || reinterpret_cast<uintptr_t>(name) < 0x1000000) return false;
     if (!is_app_process()) return false;
     if (is_hidden_staging_prop(name)) return true;
+    if (is_hidden_droidguard_prop(name)) {
+        // Keep a configured PIF value visible so find/foreach and callbacks
+        // agree with the direct get path; otherwise hide the key completely.
+        char buffer[PROP_VALUE_MAX];
+        if (find_custom_prop_override(name, buffer, false)) return false;
+        return find_custom_prop_override(name, buffer, true) == nullptr;
+    }
     for (const char* const* p = kSpoofedEmptyProps; *p; ++p) {
         if (strcmp(name, *p) == 0) return true;
+    }
+    if (is_droidguard_process() && is_rom_identity_prop_name(name)) {
+        char buffer[PROP_VALUE_MAX];
+        if (find_custom_prop_override(name, buffer, false)) return false;
+        return find_custom_prop_override(name, buffer, true) == nullptr;
     }
     return false;
 }
@@ -1423,6 +2043,17 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
     // An exact entry from the PIF config wins over everything below, as in PIFork.
     if (droidguard) {
         if (const char* v = find_custom_prop_override(name, buffer, false)) return v;
+        if (is_hidden_droidguard_prop(name)) {
+            if (const char* v = find_custom_prop_override(name, buffer, true)) return v;
+        }
+        if (is_pif_derived_name(name)) {
+            if (const char* v = find_custom_prop_override(name, buffer, true)) return v;
+            if (const char* v = pif_derived_override(name, buffer)) return v;
+        }
+        // PIF jsonProps wildcards are part of the configured identity; they
+        // must win over the fixed/dynamic fallbacks so a direct read, callback,
+        // serial lookup and build.prop rewrite all agree.
+        if (const char* v = find_custom_prop_override(name, buffer, true)) return v;
     }
     for (const PropOverride* o = kSpoofedValueProps; o->name; ++o) {
         if (strcmp(name, o->name) == 0) return o->value;
@@ -1448,13 +2079,9 @@ const char* custom_rom_hide_get_prop_override(const char* name, char* buffer) {
         int len = __system_property_get(o->staging_name, buffer);
         if (len > 0) return buffer;
     }
-    for (const PropOverride* o = kDroidGuardValueProps; o->name; ++o) {
-        if (strcmp(name, o->name) == 0) {
-            return droidguard ? o->value : nullptr;
-        }
+    if (const char* override_value = find_droidguard_value_override(name)) {
+        return droidguard ? override_value : nullptr;
     }
-    // Wildcard entries from the PIF config apply last, after the fixed tables.
-    if (droidguard) return find_custom_prop_override(name, buffer, true);
     return nullptr;
 }
 
@@ -1462,14 +2089,35 @@ bool custom_rom_hide_is_app_process() {
     return is_app_process();
 }
 
-static const PartitionDevEntry* find_partition_entry(const char* path) {
+bool custom_rom_hide_is_droidguard_process() {
+    return is_droidguard_process();
+}
+
+static const PartitionDevEntry* find_partition_entry_at(int dirfd, const char* path) {
     if (!path) return nullptr;
-    char local[32];
-    if (safe_copy_string(path, local, sizeof(local)) < 0) return nullptr;
-    for (const PartitionDevEntry* e = kPartitionDmMap; e->path; ++e) {
-        if (strcmp(local, e->path) == 0) return e;
+
+    const char* lookup_path = path;
+    int lookup_dirfd = dirfd;
+    char alias[512];
+    if (custom_rom_hide_resolve_proc_fd_path(path, alias, sizeof(alias))) {
+        lookup_path = alias;
+        lookup_dirfd = AT_FDCWD;
     }
-    return nullptr;
+
+    char resolved[512];
+    if (!resolve_path_at(lookup_dirfd, lookup_path, resolved, sizeof(resolved))) return nullptr;
+
+    const PartitionDevEntry* best = nullptr;
+    size_t best_len = 0;
+    for (const PartitionDevEntry* e = kPartitionDmMap; e->path; ++e) {
+        size_t len = strlen(e->path);
+        if (len <= best_len) continue;
+        if (strncmp(resolved, e->path, len) != 0) continue;
+        if (resolved[len] != '\0' && resolved[len] != '/') continue;
+        best = e;
+        best_len = len;
+    }
+    return best;
 }
 
 static void normalize_statfs_type(struct statfs* sf) {
@@ -1478,19 +2126,27 @@ static void normalize_statfs_type(struct statfs* sf) {
     }
 }
 
-void custom_rom_hide_spoof_stat(const char* path, struct stat* sb) {
+void custom_rom_hide_spoof_stat_at(int dirfd, const char* path, struct stat* sb) {
     if (!is_app_process() || !path || !sb) return;
-    const PartitionDevEntry* e = find_partition_entry(path);
+    const PartitionDevEntry* e = find_partition_entry_at(dirfd, path);
     if (e && major(sb->st_dev) != DM_MAJOR) sb->st_dev = makedev(DM_MAJOR, e->dm_minor);
 }
 
-void custom_rom_hide_spoof_statx(const char* path, struct statx* sx) {
+void custom_rom_hide_spoof_stat(const char* path, struct stat* sb) {
+    custom_rom_hide_spoof_stat_at(AT_FDCWD, path, sb);
+}
+
+void custom_rom_hide_spoof_statx_at(int dirfd, const char* path, struct statx* sx) {
     if (!is_app_process() || !path || !sx) return;
-    const PartitionDevEntry* e = find_partition_entry(path);
+    const PartitionDevEntry* e = find_partition_entry_at(dirfd, path);
     if (e && sx->stx_dev_major != DM_MAJOR) {
         sx->stx_dev_major = DM_MAJOR;
         sx->stx_dev_minor = e->dm_minor;
     }
+}
+
+void custom_rom_hide_spoof_statx(const char* path, struct statx* sx) {
+    custom_rom_hide_spoof_statx_at(AT_FDCWD, path, sx);
 }
 
 void custom_rom_hide_spoof_statfs(const char* path, struct statfs* sf) {
@@ -1515,7 +2171,7 @@ void custom_rom_hide_spoof_fd_stat(int fd, struct stat* sb) {
             if (raw_fstatat(AT_FDCWD, real_path, &real_sb, 0) == 0) *sb = real_sb;
             else if (load_fd_meta(fd, &meta) && meta.sb_ok) *sb = meta.sb;
         }
-    } else if (S_ISDIR(sb->st_mode) && major(sb->st_dev) != DM_MAJOR) {
+    } else if (major(sb->st_dev) != DM_MAJOR) {
         char fd_path[512];
         if (resolve_fd_path(fd, fd_path, sizeof(fd_path))) {
             custom_rom_hide_spoof_stat(fd_path, sb);
@@ -1539,8 +2195,7 @@ void custom_rom_hide_spoof_fd_statx(int fd, unsigned mask, struct statx* sx) {
             if (raw_statx(AT_FDCWD, real_path, 0, mask, &real_sx) == 0) *sx = real_sx;
             else if (load_fd_meta(fd, &meta) && meta.sx_ok) *sx = meta.sx;
         }
-    } else if ((sx->stx_mode == 0 || S_ISDIR(sx->stx_mode)) &&
-               sx->stx_dev_major != DM_MAJOR) {
+    } else if (sx->stx_dev_major != DM_MAJOR) {
         char fd_path[512];
         if (resolve_fd_path(fd, fd_path, sizeof(fd_path))) {
             custom_rom_hide_spoof_statx(fd_path, sx);

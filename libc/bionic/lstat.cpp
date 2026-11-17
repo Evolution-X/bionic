@@ -51,7 +51,7 @@ int lstat(const char* path, struct stat* sb) {
   int res = __fstatat64(AT_FDCWD, path, sb, AT_SYMLINK_NOFOLLOW);
 #endif
   if (res == 0) {
-    custom_rom_hide_spoof_stat(path, sb);
+    custom_rom_hide_spoof_stat_at(AT_FDCWD, path, sb);
   }
   return res;
 }

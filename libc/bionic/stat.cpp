@@ -74,7 +74,7 @@ int fstatat(int dirfd, const char* path, struct stat* sb, int flags) {
     if ((flags & AT_EMPTY_PATH) && custom_rom_hide_is_empty_path(path)) {
       custom_rom_hide_spoof_fd_stat(dirfd, sb);
     } else {
-      custom_rom_hide_spoof_stat(path, sb);
+      custom_rom_hide_spoof_stat_at(dirfd, path, sb);
     }
   }
   return res;
@@ -88,7 +88,7 @@ int stat(const char* path, struct stat* sb) {
   }
   int res = raw_fstatat(AT_FDCWD, path, sb, 0);
   if (res == 0) {
-    custom_rom_hide_spoof_stat(path, sb);
+    custom_rom_hide_spoof_stat_at(AT_FDCWD, path, sb);
   }
   return res;
 }
@@ -104,7 +104,7 @@ int statx(int dirfd, const char* path, int flags, unsigned mask, struct statx* b
     if ((flags & AT_EMPTY_PATH) && custom_rom_hide_is_empty_path(path)) {
       custom_rom_hide_spoof_fd_statx(dirfd, mask, buf);
     } else {
-      custom_rom_hide_spoof_statx(path, buf);
+      custom_rom_hide_spoof_statx_at(dirfd, path, buf);
     }
   }
   return res;
